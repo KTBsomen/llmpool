@@ -340,7 +340,7 @@ async function monitoringExample() {
 // Configuration validation example
 async function validateConfiguration() {
   try {
-    const { ConfigManager } = require('./llm-pool');
+    const { ConfigManager } = require('../src/llm-pool');
     
     const configManager = new ConfigManager({
       configPath: './config.json'

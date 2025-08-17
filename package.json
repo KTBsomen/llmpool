@@ -1,14 +1,14 @@
  
 {
   "name": "llmpool",
-  "version": "0.0.1",
+  "version": "0.0.3",
   "description": "Production-ready LLM API pool manager with load balancing, failover, and dynamic configuration",
-  "main": "index.js",
+  "main": "./src/index.js",
   "scripts": {
-    "start": "node example.js",
+    "start": "node ./examples/example.js",
     "test": "jest",
-    "validate-config": "node -e 'require(\"./example.js\").validateConfiguration()'",
-    "health-check": "node -e 'require(\"./example.js\").monitoringExample()'",
+    "validate-config": "node -e 'require(\"./examples/example.js\").validateConfiguration()'",
+    "health-check": "node -e 'require(\"./examples/example.js\").monitoringExample()'",
     "lint": "eslint *.js",
     "format": "prettier --write *.js"
   },
