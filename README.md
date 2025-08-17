@@ -242,6 +242,7 @@ const pool = new LLMPool({
 | Provider | Type | Base URL |
 |----------|------|----------|
 | OpenAI | `openai` | `https://api.openai.com/v1` |
+| OpenAI | `gemini` | `https://generativelanguage.googleapis.com/v1beta/openai/` |
 | Anthropic | `anthropic` | `https://api.anthropic.com/v1` |
 | Groq | `groq` | `https://api.groq.com/openai/v1` |
 | Together AI | `together` | `https://api.together.xyz/v1` |

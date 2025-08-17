@@ -3,7 +3,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [1.0.0] - 2025-08-17
+## [0.0.1] - 2025-08-17
 
 ### Added
 - Initial release of LLM Pool Manager
@@ -24,3 +24,9 @@ All notable changes to this project will be documented in this file.
 - Secure API key management
 - Configuration validation
 - Event-driven architecture
+
+## [0.0.2] - 2025-08-17
+### Added
+- gemini support added.
+### Features
+- call gemini api with open ai compatible apis

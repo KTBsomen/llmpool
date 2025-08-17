@@ -12,7 +12,8 @@ const PROVIDERS = {
   OPENAI: 'openai',
   ANTHROPIC: 'anthropic',
   COHERE: 'cohere',
-  TOGETHER: 'together'
+  TOGETHER: 'together',
+  GEMINI:'gemini'
 };
 
 // Message types
@@ -419,6 +420,7 @@ class LLMPool extends EventEmitter {
       case PROVIDERS.OPENAI:
       case PROVIDERS.GROQ:
       case PROVIDERS.TOGETHER:
+      case PROVIDERS.GEMINI:
         return {
           ...baseRequest,
           messages: request.messages,
@@ -507,6 +509,7 @@ class LLMPool extends EventEmitter {
       case PROVIDERS.OPENAI:
       case PROVIDERS.GROQ:
       case PROVIDERS.TOGETHER:
+      case PROVIDERS.GEMINI:
         headers['Authorization'] = `Bearer ${provider.apiKey}`;
         break;
         
@@ -528,6 +531,7 @@ class LLMPool extends EventEmitter {
       case PROVIDERS.OPENAI:
       case PROVIDERS.GROQ:
       case PROVIDERS.TOGETHER:
+      case PROVIDERS.GEMINI:
         return `${provider.baseURL}/chat/completions`;
         
       case PROVIDERS.ANTHROPIC:
@@ -548,6 +552,7 @@ class LLMPool extends EventEmitter {
     switch (provider.type) {
       case PROVIDERS.OPENAI:
       case PROVIDERS.GROQ:
+      case PROVIDERS.GEMINI:
       case PROVIDERS.TOGETHER:
         content = responseData.choices?.[0]?.message?.content || '';
         usage = responseData.usage || usage;
