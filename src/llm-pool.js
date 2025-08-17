@@ -1,10 +1,9 @@
- 
 const axios = require('axios');
 const crypto = require('crypto');
 const fs = require('fs').promises;
 const path = require('path');
 const EventEmitter = require('events');
-const { encode } = require('gpt-tokenizer');
+const { encoding_for_model } = require('tiktoken');
 
 // Provider types
 const PROVIDERS = {
@@ -13,13 +12,40 @@ const PROVIDERS = {
   ANTHROPIC: 'anthropic',
   COHERE: 'cohere',
   TOGETHER: 'together',
-  GEMINI:'gemini'
+  GEMINI: 'gemini'
+};
+
+const ENDPOINTS = {
+  openai: 'https://api.openai.com/v1',
+  gemini: 'https://generativelanguage.googleapis.com/v1beta/openai',
+  anthropic: 'https://api.anthropic.com/v1',
+  groq: 'https://api.groq.com/openai/v1',
+  together: 'https://api.together.xyz/v1',
+  cohere: 'https://api.cohere.ai/v1'
 };
 
 // Message types
 const MESSAGE_TYPES = {
   TEXT: 'text',
   IMAGE_URL: 'image_url'
+};
+
+// Token pricing per 1M tokens (input/output)
+const TOKEN_PRICING = {
+  'gpt-4': { input: 30, output: 60 },
+  'gpt-4-turbo': { input: 10, output: 30 },
+  'gpt-3.5-turbo': { input: 0.5, output: 1.5 },
+  'claude-3-opus': { input: 15, output: 75 },
+  'claude-3-sonnet': { input: 3, output: 15 },
+  'claude-3-haiku': { input: 0.25, output: 1.25 },
+  'gemini-pro': { input: 0.5, output: 1.5 }
+};
+
+// Image token costs (approximate)
+const IMAGE_TOKEN_COSTS = {
+  'low': 85,    // Low detail
+  'high': 170,  // High detail
+  'auto': 127   // Average
 };
 
 class ProviderError extends Error {
@@ -45,6 +71,125 @@ class RateLimitError extends Error {
     this.name = 'RateLimitError';
     this.provider = provider;
     this.resetTime = resetTime;
+  }
+}
+
+class TokenCounter {
+  constructor() {
+    this.encoders = new Map();
+  }
+
+  getEncoder(model) {
+    if (!this.encoders.has(model)) {
+      try {
+        // Try to get model-specific encoder
+        const encoder = encoding_for_model(model);
+        this.encoders.set(model, encoder);
+        return encoder;
+      } catch (error) {
+        // Fallback to gpt-3.5-turbo encoder
+        if (!this.encoders.has('fallback')) {
+          const fallbackEncoder = encoding_for_model('gpt-3.5-turbo');
+          this.encoders.set('fallback', fallbackEncoder);
+        }
+        return this.encoders.get('fallback');
+      }
+    }
+    return this.encoders.get(model);
+  }
+
+  countTokensInText(text, model = 'gpt-3.5-turbo') {
+    try {
+      const encoder = this.getEncoder(model);
+      return encoder.encode(text).length;
+    } catch (error) {
+      console.warn('Token counting failed, using fallback estimation:', error.message);
+      // Fallback: roughly 4 characters per token
+      return Math.ceil(text.length / 4);
+    }
+  }
+
+  countTokensInMessages(messages, model = 'gpt-3.5-turbo') {
+    let totalTokens = 0;
+    const encoder = this.getEncoder(model);
+    
+    // Base tokens per message (varies by model)
+    const baseTokensPerMessage = model.includes('gpt-4') ? 3 : 4;
+    const baseTokensPerName = 1;
+
+    for (const message of messages) {
+      totalTokens += baseTokensPerMessage;
+      
+      if (message.name) {
+        totalTokens += baseTokensPerName;
+        totalTokens += this.countTokensInText(message.name, model);
+      }
+
+      if (typeof message.content === 'string') {
+        totalTokens += this.countTokensInText(message.content, model);
+      } else if (Array.isArray(message.content)) {
+        for (const part of message.content) {
+          if (part.type === MESSAGE_TYPES.TEXT && part.text) {
+            totalTokens += this.countTokensInText(part.text, model);
+          } else if (part.type === MESSAGE_TYPES.IMAGE_URL) {
+            // Add image token cost
+            const detail = part.image_url?.detail || 'auto';
+            totalTokens += IMAGE_TOKEN_COSTS[detail] || IMAGE_TOKEN_COSTS.auto;
+          }
+        }
+      }
+    }
+
+    // Add base tokens for the assistant's reply
+    totalTokens += 3;
+    
+    return totalTokens;
+  }
+
+  cleanup() {
+    for (const encoder of this.encoders.values()) {
+      encoder.free();
+    }
+    this.encoders.clear();
+  }
+}
+
+class PersistenceManager {
+  constructor(filePath = './llm_pool_stats.json') {
+    this.filePath = filePath;
+  }
+
+  async saveStats(providers) {
+    const stats = {};
+    for (const [name, provider] of providers) {
+      stats[name] = {
+        totalRequests: provider.totalRequests,
+        errors: provider.errors,
+        totalTokensUsed: provider.totalTokensUsed,
+        totalCost: provider.totalCost,
+        responseTimeHistory: provider.responseTimeHistory.slice(-50), // Keep last 50
+        failureCount: provider.failureCount,
+        lastFailure: provider.lastFailure,
+        lastUsed: provider.lastUsed,
+        successfulRequests: provider.successfulRequests || 0
+      };
+    }
+
+    try {
+      await fs.writeFile(this.filePath, JSON.stringify(stats, null, 2));
+    } catch (error) {
+      console.warn('Failed to save provider stats:', error.message);
+    }
+  }
+
+  async loadStats() {
+    try {
+      const data = await fs.readFile(this.filePath, 'utf8');
+      return JSON.parse(data);
+    } catch (error) {
+      // File doesn't exist or is invalid, return empty stats
+      return {};
+    }
   }
 }
 
@@ -74,8 +219,9 @@ class Provider {
     this.circuitBreakerTimeout = config.circuit_breaker_timeout || 60000; // 1 minute
     this.isCircuitBreakerOpen = false;
     
-    // Usage tracking
+    // Usage tracking (will be loaded from persistence)
     this.totalRequests = 0;
+    this.successfulRequests = 0;
     this.errors = 0;
     this.lastUsed = null;
     this.totalTokensUsed = 0;
@@ -90,13 +236,13 @@ class Provider {
     this.temperature = config.temperature || 0.7;
     this.timeout = config.timeout || 30000;
     
-    // Token pricing (tokens per dollar)
-    this.inputTokenPrice = config.input_token_price || 0;
-    this.outputTokenPrice = config.output_token_price || 0;
+    // Token pricing (per 1M tokens)
+    this.inputTokenPrice = config.input_token_price || TOKEN_PRICING[this.model]?.input || 0;
+    this.outputTokenPrice = config.output_token_price || TOKEN_PRICING[this.model]?.output || 0;
   }
   
   validateConfig(config) {
-    const required = ['name', 'type', 'api_key', 'base_url', 'model'];
+    const required = ['name', 'type', 'api_key', 'model'];
     for (const field of required) {
       if (!config[field]) {
         throw new ConfigurationError(`Missing required field: ${field}`);
@@ -105,6 +251,20 @@ class Provider {
     
     if (!Object.values(PROVIDERS).includes(config.type)) {
       throw new ConfigurationError(`Unsupported provider type: ${config.type}`);
+    }
+  }
+
+  loadPersistedStats(stats) {
+    if (stats) {
+      this.totalRequests = stats.totalRequests || 0;
+      this.successfulRequests = stats.successfulRequests || 0;
+      this.errors = stats.errors || 0;
+      this.totalTokensUsed = stats.totalTokensUsed || 0;
+      this.totalCost = stats.totalCost || 0;
+      this.responseTimeHistory = stats.responseTimeHistory || [];
+      this.failureCount = stats.failureCount || 0;
+      this.lastFailure = stats.lastFailure ? new Date(stats.lastFailure) : null;
+      this.lastUsed = stats.lastUsed ? new Date(stats.lastUsed) : null;
     }
   }
   
@@ -118,7 +278,7 @@ class Provider {
       }
       // Try to close circuit breaker
       this.isCircuitBreakerOpen = false;
-      this.failureCount = 0;
+      this.failureCount = Math.max(0, this.failureCount - 1);
     }
     
     // Reset rate limit counters
@@ -152,7 +312,9 @@ class Provider {
     }
     
     if (success) {
-      this.failureCount = Math.max(0, this.failureCount - 1);
+      this.successfulRequests++;
+      // Gradually reduce failure count on success
+      this.failureCount = Math.max(0, this.failureCount - 0.5);
     } else {
       this.errors++;
       this.failureCount++;
@@ -171,7 +333,28 @@ class Provider {
   
   getSuccessRate() {
     if (this.totalRequests === 0) return 100;
-    return ((this.totalRequests - this.errors) / this.totalRequests) * 100;
+    return (this.successfulRequests / this.totalRequests) * 100;
+  }
+  
+  getReliabilityScore() {
+    const successRate = this.getSuccessRate();
+    const avgResponseTime = this.getAverageResponseTime();
+    const recency = this.lastUsed ? (Date.now() - this.lastUsed.getTime()) / (1000 * 60 * 60) : 24; // Hours since last use
+    
+    // Higher score is better
+    let score = successRate;
+    
+    // Penalize slow response times
+    if (avgResponseTime > 5000) score -= 20;
+    else if (avgResponseTime > 2000) score -= 10;
+    
+    // Penalize circuit breaker being open
+    if (this.isCircuitBreakerOpen) score -= 50;
+    
+    // Slight penalty for not being used recently (prefer proven providers)
+    if (recency > 1) score -= Math.min(recency * 2, 20);
+    
+    return Math.max(0, score);
   }
   
   getHealth() {
@@ -183,6 +366,7 @@ class Provider {
       requestsRemaining: Math.max(0, this.requestsPerMinute - this.requestCount),
       dailyRequestsRemaining: Math.max(0, this.requestsPerDay - this.dailyRequestCount),
       successRate: this.getSuccessRate(),
+      reliabilityScore: this.getReliabilityScore(),
       averageResponseTime: this.getAverageResponseTime(),
       totalRequests: this.totalRequests,
       errors: this.errors,
@@ -228,7 +412,7 @@ class ConfigManager extends EventEmitter {
       const response = await axios.get(this.configUrl, {
         timeout: 10000,
         headers: {
-          'User-Agent': 'llmpool/1.0'
+          'User-Agent': 'llmpool/2.0'
         }
       });
       return response.data;
@@ -300,12 +484,13 @@ class LLMPool extends EventEmitter {
     super();
     this.providers = new Map();
     this.configManager = new ConfigManager(options);
+    this.persistenceManager = new PersistenceManager(options.statsFile);
+    this.tokenCounter = new TokenCounter();
+    
     this.defaultTimeout = options.timeout || 30000;
     this.maxRetries = options.maxRetries || 3;
     this.retryDelay = options.retryDelay || 1000;
-    
-    // Token counting
-    this.useTokenCounting = options.useTokenCounting !== false;
+    this.saveStatsInterval = options.saveStatsInterval || 60000; // 1 minute
     
     // Setup config manager
     this.configManager.on('configChanged', (config) => {
@@ -315,31 +500,42 @@ class LLMPool extends EventEmitter {
     this.configManager.on('error', (error) => {
       this.emit('error', error);
     });
+
+    // Auto-save stats periodically
+    this.statsInterval = setInterval(() => {
+      this.saveStats();
+    }, this.saveStatsInterval);
   }
   
   async initialize() {
+    // Load persisted stats first
+    const persistedStats = await this.persistenceManager.loadStats();
+    
     const config = await this.configManager.loadConfig();
-    this.updateProviders(config.providers);
+    this.updateProviders(config.providers, persistedStats);
     this.configManager.startWatching();
     this.emit('ready');
   }
   
-  updateProviders(providerConfigs) {
+  updateProviders(providerConfigs, persistedStats = {}) {
     const newProviders = new Map();
     
     for (const config of providerConfigs) {
       const provider = new Provider(config);
       
-      // Preserve stats from existing provider if it exists
+      // Load persisted stats for this provider
+      const stats = persistedStats[provider.name];
+      if (stats) {
+        provider.loadPersistedStats(stats);
+      }
+      
+      // Preserve runtime stats from existing provider if it exists
       const existing = this.providers.get(provider.name);
       if (existing) {
-        provider.totalRequests = existing.totalRequests;
-        provider.errors = existing.errors;
-        provider.totalTokensUsed = existing.totalTokensUsed;
-        provider.totalCost = existing.totalCost;
-        provider.responseTimeHistory = existing.responseTimeHistory;
-        provider.failureCount = existing.failureCount;
-        provider.lastFailure = existing.lastFailure;
+        provider.requestCount = existing.requestCount;
+        provider.dailyRequestCount = existing.dailyRequestCount;
+        provider.lastReset = existing.lastReset;
+        provider.lastDailyReset = existing.lastDailyReset;
         provider.isCircuitBreakerOpen = existing.isCircuitBreakerOpen;
       }
       
@@ -351,62 +547,61 @@ class LLMPool extends EventEmitter {
   }
   
   selectProvider(excludeProviders = []) {
+    console.log(`Selecting provider. Total providers: ${this.providers.size}, Excluded: [${excludeProviders.join(', ')}]`);
+    
+    // First, get providers that can be used and are not excluded
     const availableProviders = Array.from(this.providers.values())
-      .filter(p => p.canUse() && !excludeProviders.includes(p.name))
+      .filter(p => {
+        const canUse = p.canUse();
+        const notExcluded = !excludeProviders.includes(p.name);
+        console.log(`Provider ${p.name}: canUse=${canUse}, notExcluded=${notExcluded}, circuitOpen=${p.isCircuitBreakerOpen}`);
+        return canUse && notExcluded;
+      })
       .sort((a, b) => {
-        // Sort by priority first
+        // Sort by priority first (lower number = higher priority)
         if (a.priority !== b.priority) {
           return a.priority - b.priority;
         }
         
-        // Then by success rate
-        const successRateDiff = b.getSuccessRate() - a.getSuccessRate();
-        if (Math.abs(successRateDiff) > 5) { // 5% threshold
-          return successRateDiff;
+        // Then by reliability score (higher is better)
+        const reliabilityDiff = b.getReliabilityScore() - a.getReliabilityScore();
+        if (Math.abs(reliabilityDiff) > 5) {
+          return reliabilityDiff;
         }
         
-        // Then by average response time
+        // Then by average response time (lower is better)
         return a.getAverageResponseTime() - b.getAverageResponseTime();
       });
     
-    if (availableProviders.length === 0) {
-      // If no providers available, try the least recently used
-      const allProviders = Array.from(this.providers.values())
-        .filter(p => !excludeProviders.includes(p.name))
-        .sort((a, b) => {
-          if (!a.lastUsed) return -1;
-          if (!b.lastUsed) return 1;
-          return a.lastUsed - b.lastUsed;
-        });
-      
-      return allProviders[0] || null;
+    if (availableProviders.length > 0) {
+      console.log(`Selected available provider: ${availableProviders[0].name}`);
+      return availableProviders[0];
     }
     
-    return availableProviders[0];
+    // If no available providers, try to find any provider not excluded (ignore canUse restrictions)
+    const fallbackProviders = Array.from(this.providers.values())
+      .filter(p => !excludeProviders.includes(p.name))
+      .sort((a, b) => {
+        // Prefer providers that haven't failed recently
+        if (!a.lastFailure && b.lastFailure) return -1;
+        if (a.lastFailure && !b.lastFailure) return 1;
+        if (!a.lastFailure && !b.lastFailure) return a.priority - b.priority;
+        
+        // Both have failures, prefer the one with older failure
+        return a.lastFailure.getTime() - b.lastFailure.getTime();
+      });
+    
+    if (fallbackProviders.length > 0) {
+      console.log(`Selected fallback provider: ${fallbackProviders[0].name} (ignoring canUse restrictions)`);
+      return fallbackProviders[0];
+    }
+    
+    console.log('No providers available');
+    return null;
   }
   
   estimateTokens(messages, model = 'gpt-3.5-turbo') {
-    if (!this.useTokenCounting) return 0;
-    
-    try {
-      let text = '';
-      for (const message of messages) {
-        if (typeof message.content === 'string') {
-          text += message.content + ' ';
-        } else if (Array.isArray(message.content)) {
-          for (const part of message.content) {
-            if (part.type === MESSAGE_TYPES.TEXT) {
-              text += part.text + ' ';
-            }
-          }
-        }
-      }
-      
-      return encode(text).length;
-    } catch (error) {
-      console.warn('Token estimation failed:', error.message);
-      return 0;
-    }
+    return this.tokenCounter.countTokensInMessages(messages, model);
   }
   
   formatRequestForProvider(provider, request) {
@@ -502,7 +697,7 @@ class LLMPool extends EventEmitter {
   getRequestHeaders(provider) {
     const headers = {
       'Content-Type': 'application/json',
-      'User-Agent': 'llmpool/1.0'
+      'User-Agent': 'llmpool/2.0'
     };
     
     switch (provider.type) {
@@ -532,13 +727,13 @@ class LLMPool extends EventEmitter {
       case PROVIDERS.GROQ:
       case PROVIDERS.TOGETHER:
       case PROVIDERS.GEMINI:
-        return `${provider.baseURL}/chat/completions`;
+        return `${provider.baseURL ?? ENDPOINTS[provider.type]}/chat/completions`;
         
       case PROVIDERS.ANTHROPIC:
-        return `${provider.baseURL}/messages`;
+        return `${provider.baseURL ?? ENDPOINTS[provider.type]}/messages`;
         
       case PROVIDERS.COHERE:
-        return `${provider.baseURL}/chat`;
+        return `${provider.baseURL ?? ENDPOINTS[provider.type]}/chat`;
         
       default:
         throw new ProviderError(`Unsupported provider type: ${provider.type}`, provider.name);
@@ -571,8 +766,8 @@ class LLMPool extends EventEmitter {
         content = responseData.text || '';
         // Cohere doesn't provide token usage, estimate it
         usage = {
-          prompt_tokens: this.estimateTokens([{ content: 'prompt' }]),
-          completion_tokens: this.estimateTokens([{ content }]),
+          prompt_tokens: this.tokenCounter.countTokensInText('prompt estimation'),
+          completion_tokens: this.tokenCounter.countTokensInText(content),
           total_tokens: 0
         };
         usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
@@ -626,7 +821,7 @@ class LLMPool extends EventEmitter {
       }
       
       if (response.status >= 400) {
-        const retryable = response.status >= 500 || response.status === 429;
+        const retryable = response.status >= 500 || response.status === 429 || response.status === 408;
         throw new ProviderError(
           `Request failed with status ${response.status}: ${response.data?.error?.message || response.statusText}`,
           provider.name,
@@ -650,11 +845,17 @@ class LLMPool extends EventEmitter {
         throw error;
       }
       
+      // Network/timeout errors are usually retryable
+      const retryable = error.code === 'ECONNABORTED' || 
+                       error.code === 'ECONNRESET' || 
+                       error.code === 'ETIMEDOUT' ||
+                       error.response?.status >= 500;
+      
       throw new ProviderError(
         `Network error: ${error.message}`,
         provider.name,
-        0,
-        true
+        error.response?.status || 0,
+        retryable
       );
     }
   }
@@ -665,57 +866,115 @@ class LLMPool extends EventEmitter {
     }
     
     const excludeProviders = [];
-    let lastError = null;
+    const errors = [];
+    let totalAttempts = 0;
+    const maxTotalAttempts = this.maxRetries * this.providers.size; // Allow trying all providers multiple times
     
-    for (let attempt = 0; attempt < this.maxRetries; attempt++) {
+    while (totalAttempts < maxTotalAttempts) {
       const provider = this.selectProvider(excludeProviders);
       
       if (!provider) {
-        const error = new Error(`No available providers after ${attempt + 1} attempts. Last error: ${lastError?.message || 'Unknown'}`);
-        error.lastError = lastError;
+        // If no providers available, reset exclusions and try again with fresh providers
+        if (excludeProviders.length > 0) {
+          console.log('No available providers, resetting exclusions and trying again...');
+          excludeProviders.length = 0; // Clear exclusions
+          
+          // Wait a bit before retrying all providers
+          await new Promise(resolve => setTimeout(resolve, this.retryDelay));
+          continue;
+        }
+        
+        // No providers at all
+        const errorMsg = `No providers available after ${totalAttempts + 1} attempts. Errors: ${errors.map(e => `${e.provider}: ${e.message}`).join('; ')}`;
+        const error = new Error(errorMsg);
+        error.attempts = totalAttempts + 1;
+        error.errors = errors;
         throw error;
       }
       
+      totalAttempts++;
+      
       try {
+        console.log(`Attempt ${totalAttempts}: Trying provider ${provider.name}`);
         const result = await this.makeRequest(provider, request);
         
         this.emit('requestSuccess', {
           provider: provider.name,
-          attempt: attempt + 1,
-          result
+          attempt: totalAttempts,
+          result,
+          excludedProviders: [...excludeProviders],
+          totalErrors: errors.length
         });
         
         return result;
         
       } catch (error) {
-        lastError = error;
+        console.log(`Provider ${provider.name} failed: ${error.message}`);
+        
+        errors.push({
+          provider: provider.name,
+          message: error.message,
+          attempt: totalAttempts,
+          retryable: error.retryable !== false,
+          statusCode: error.statusCode || 0
+        });
         
         this.emit('requestError', {
           provider: provider.name,
-          attempt: attempt + 1,
-          error: error.message
+          attempt: totalAttempts,
+          error: error.message,
+          retryable: error.retryable !== false,
+          excludedProviders: [...excludeProviders]
         });
         
+        // Always exclude the failed provider for this request cycle
+        if (!excludeProviders.includes(provider.name)) {
+          excludeProviders.push(provider.name);
+        }
+        
+        // Handle different error types
         if (error instanceof RateLimitError) {
-          excludeProviders.push(provider.name);
+          console.log(`Rate limit hit for ${provider.name}, trying next provider...`);
+          // Continue immediately to next provider
           continue;
         }
         
-        if (error instanceof ProviderError && error.retryable) {
-          excludeProviders.push(provider.name);
-          
-          if (attempt < this.maxRetries - 1) {
-            await new Promise(resolve => setTimeout(resolve, this.retryDelay * (attempt + 1)));
+        if (error instanceof ProviderError) {
+          if (error.retryable) {
+            console.log(`Retryable error from ${provider.name}, trying next provider...`);
+            // Add small delay before trying next provider
+            await new Promise(resolve => setTimeout(resolve, Math.min(this.retryDelay, 1000)));
+            continue;
+          } else {
+            console.log(`Non-retryable error from ${provider.name}: ${error.message}`);
+            // For non-retryable errors, still try other providers
+            continue;
           }
-          continue;
         }
         
-        // Non-retryable error
-        throw error;
+        // For any other error type, try next provider
+        console.log(`Unknown error type from ${provider.name}, trying next provider...`);
+        continue;
       }
     }
     
-    throw lastError || new Error('All retry attempts failed');
+    // All attempts exhausted
+    const finalError = new Error(
+      `All ${totalAttempts} attempts failed across ${this.providers.size} providers. ` +
+      `Errors: ${errors.map(e => `${e.provider}: ${e.message}`).join('; ')}`
+    );
+    finalError.attempts = totalAttempts;
+    finalError.errors = errors;
+    finalError.providersAttempted = [...new Set(errors.map(e => e.provider))];
+    throw finalError;
+  }
+  
+  async saveStats() {
+    try {
+      await this.persistenceManager.saveStats(this.providers);
+    } catch (error) {
+      this.emit('error', new Error(`Failed to save stats: ${error.message}`));
+    }
   }
   
   getProviderStats() {
@@ -724,10 +983,12 @@ class LLMPool extends EventEmitter {
     for (const [name, provider] of this.providers) {
       stats[name] = {
         type: provider.type,
+        model: provider.model,
         priority: provider.priority,
         health: provider.getHealth(),
         usage: {
           totalRequests: provider.totalRequests,
+          successfulRequests: provider.successfulRequests,
           errors: provider.errors,
           totalTokensUsed: provider.totalTokensUsed,
           totalCost: provider.totalCost,
@@ -736,6 +997,7 @@ class LLMPool extends EventEmitter {
         },
         performance: {
           successRate: provider.getSuccessRate(),
+          reliabilityScore: provider.getReliabilityScore(),
           averageResponseTime: provider.getAverageResponseTime(),
           circuitBreakerOpen: provider.isCircuitBreakerOpen
         }
@@ -753,12 +1015,135 @@ class LLMPool extends EventEmitter {
       totalProviders: providers.length,
       availableProviders: availableProviders.length,
       healthy: availableProviders.length > 0,
-      providers: this.getProviderStats()
+      providers: this.getProviderStats(),
+      bestProvider: availableProviders.length > 0 ? this.selectProvider().name : null
     };
   }
   
+  // Get detailed analytics
+  getAnalytics(timeRange = '24h') {
+    const providers = Array.from(this.providers.values());
+    const now = new Date();
+    let cutoffTime;
+    
+    switch (timeRange) {
+      case '1h':
+        cutoffTime = new Date(now.getTime() - 60 * 60 * 1000);
+        break;
+      case '24h':
+        cutoffTime = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+        break;
+      case '7d':
+        cutoffTime = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        break;
+      default:
+        cutoffTime = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    }
+    
+    const analytics = {
+      timeRange,
+      totalRequests: 0,
+      totalSuccessful: 0,
+      totalErrors: 0,
+      totalTokens: 0,
+      totalCost: 0,
+      averageResponseTime: 0,
+      providerBreakdown: {}
+    };
+    
+    let totalResponseTime = 0;
+    let responseTimeCount = 0;
+    
+    for (const provider of providers) {
+      analytics.totalRequests += provider.totalRequests;
+      analytics.totalSuccessful += provider.successfulRequests;
+      analytics.totalErrors += provider.errors;
+      analytics.totalTokens += provider.totalTokensUsed;
+      analytics.totalCost += provider.totalCost;
+      
+      if (provider.responseTimeHistory.length > 0) {
+        const avgTime = provider.getAverageResponseTime();
+        totalResponseTime += avgTime * provider.responseTimeHistory.length;
+        responseTimeCount += provider.responseTimeHistory.length;
+      }
+      
+      analytics.providerBreakdown[provider.name] = {
+        requests: provider.totalRequests,
+        successful: provider.successfulRequests,
+        errors: provider.errors,
+        successRate: provider.getSuccessRate(),
+        tokens: provider.totalTokensUsed,
+        cost: provider.totalCost,
+        avgResponseTime: provider.getAverageResponseTime(),
+        lastUsed: provider.lastUsed
+      };
+    }
+    
+    analytics.averageResponseTime = responseTimeCount > 0 ? 
+      totalResponseTime / responseTimeCount : 0;
+    
+    analytics.overallSuccessRate = analytics.totalRequests > 0 ? 
+      (analytics.totalSuccessful / analytics.totalRequests) * 100 : 0;
+    
+    return analytics;
+  }
+  
+  // Force reset circuit breakers
+  resetCircuitBreakers() {
+    for (const provider of this.providers.values()) {
+      provider.isCircuitBreakerOpen = false;
+      provider.failureCount = 0;
+    }
+    this.emit('circuitBreakersReset');
+  }
+  
+  // Debug method to see provider states
+  debugProviderStates() {
+    console.log('\n=== Provider Debug Info ===');
+    for (const [name, provider] of this.providers) {
+      console.log(`Provider: ${name}`);
+      console.log(`  Type: ${provider.type}`);
+      console.log(`  Priority: ${provider.priority}`);
+      console.log(`  Can Use: ${provider.canUse()}`);
+      console.log(`  Circuit Breaker Open: ${provider.isCircuitBreakerOpen}`);
+      console.log(`  Failure Count: ${provider.failureCount}`);
+      console.log(`  Requests This Minute: ${provider.requestCount}/${provider.requestsPerMinute}`);
+      console.log(`  Daily Requests: ${provider.dailyRequestCount}/${provider.requestsPerDay}`);
+      console.log(`  Total Requests: ${provider.totalRequests}`);
+      console.log(`  Success Rate: ${provider.getSuccessRate().toFixed(2)}%`);
+      console.log(`  Reliability Score: ${provider.getReliabilityScore().toFixed(2)}`);
+      console.log(`  Last Used: ${provider.lastUsed || 'Never'}`);
+      console.log(`  Last Failure: ${provider.lastFailure || 'None'}`);
+      console.log(`  Avg Response Time: ${provider.getAverageResponseTime().toFixed(0)}ms`);
+      console.log('');
+    }
+    console.log('=== End Provider Debug ===\n');
+  }
+  
+  // Manually adjust provider priority
+  setProviderPriority(providerName, priority) {
+    const provider = this.providers.get(providerName);
+    if (provider) {
+      provider.priority = priority;
+      this.emit('providerPriorityChanged', { provider: providerName, priority });
+    }
+  }
+  
   async shutdown() {
+    // Save final stats
+    await this.saveStats();
+    
+    // Clear intervals
+    if (this.statsInterval) {
+      clearInterval(this.statsInterval);
+    }
+    
+    // Stop config watching
     this.configManager.stopWatching();
+    
+    // Cleanup token counter
+    this.tokenCounter.cleanup();
+    
     this.emit('shutdown');
   }
 }
@@ -769,13 +1154,27 @@ function createTextMessage(role, content) {
 }
 
 // Helper function to create a message with image
-function createImageMessage(role, text, imageUrl) {
+function createImageMessage(role, text, imageUrl, detail = 'auto') {
   return {
     role,
     content: [
       { type: MESSAGE_TYPES.TEXT, text },
-      { type: MESSAGE_TYPES.IMAGE_URL, image_url: { url: imageUrl } }
+      { 
+        type: MESSAGE_TYPES.IMAGE_URL, 
+        image_url: { 
+          url: imageUrl,
+          detail: detail
+        } 
+      }
     ]
+  };
+}
+
+// Helper function to create mixed content message
+function createMixedMessage(role, parts) {
+  return {
+    role,
+    content: parts
   };
 }
 
@@ -783,11 +1182,16 @@ module.exports = {
   LLMPool,
   ConfigManager,
   Provider,
+  PersistenceManager,
+  TokenCounter,
   ProviderError,
   ConfigurationError,
   RateLimitError,
   PROVIDERS,
   MESSAGE_TYPES,
+  TOKEN_PRICING,
+  IMAGE_TOKEN_COSTS,
   createTextMessage,
-  createImageMessage
+  createImageMessage,
+  createMixedMessage
 };

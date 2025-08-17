@@ -1,7 +1,7 @@
  
 {
   "name": "llmpool",
-  "version": "0.0.3",
+  "version": "0.0.6",
   "description": "Production-ready LLM API pool manager with load balancing, failover, and dynamic configuration",
   "main": "./src/index.js",
   "scripts": {
